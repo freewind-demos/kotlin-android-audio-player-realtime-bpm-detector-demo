@@ -7,10 +7,10 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.Lifecycle
 import demos.bpmdetector.databinding.ActivityMainBinding
-import demos.bpmdetector.domain.handler.BpmEstimator
 import demos.bpmdetector.domain.handler.PlayerHandler
 import demos.bpmdetector.domain.store.PlayerStore
 import demos.bpmdetector.infra.system.AudioPickerSystemApi
+import demos.bpmdetector.infra.system.AudioPcmDecoderSystemApi
 import demos.bpmdetector.infra.system.AudioPlayerSystemApi
 import kotlinx.coroutines.launch
 
@@ -41,7 +41,7 @@ class MainActivity : ComponentActivity() {
             store = store,
             audioPickerSystemApi = AudioPickerSystemApi(contentResolver),
             audioPlayerSystemApi = AudioPlayerSystemApi(this),
-            bpmEstimator = BpmEstimator(),
+            audioPcmDecoderSystemApi = AudioPcmDecoderSystemApi(contentResolver),
         )
 
         binding.pickAudioButton.setOnClickListener {

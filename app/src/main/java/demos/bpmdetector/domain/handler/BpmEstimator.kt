@@ -1,68 +1,116 @@
 package demos.bpmdetector.domain.handler
 
-import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.sqrt
 
-// 纯算法：把实时波形估算成 BPM。
+// 纯算法：把整首歌的 PCM 包络估算成 BPM。
 class BpmEstimator(
     // 估算下限，排除过慢周期。
     private val minBpm: Int = 70,
     // 估算上限，排除过快周期。
     private val maxBpm: Int = 190,
-    // 保存最近一段能量窗口，做自相关。
-    private val windowCapacity: Int = 512,
+    // 短时能量窗口，提取节奏包络。
+    private val frameSize: Int = 1024,
+    // 相邻窗口的滑动步长。
+    private val hopSize: Int = 512,
+    // 能量平滑系数，弱化持续音量，突出拍点起伏。
+    private val energySmoothing: Float = 0.85f,
 ) {
-    // 滑动窗口里的短时能量序列。
-    private val energyWindow = ArrayDeque<Float>()
-    // 平滑后的 BPM，减少数字抖动。
-    private var smoothedBpm: Float? = null
+    // 整首歌的 onset 包络。
+    private val onsetEnvelope = ArrayList<Float>()
+    // 采样率由解码器提供。
+    private var sampleRate: Int = 0
+    // 分块解码时缓存未处理样本。
+    private var pendingSamples = FloatArray(frameSize * 4)
+    private var pendingSize: Int = 0
+    // 平滑能量基线，做简单 onset detection。
+    private var smoothedEnergy: Float = 0f
+    private var hasSmoothedEnergy: Boolean = false
 
-    // 切歌或停止时清空历史。
+    // 新文件分析前清空历史。
     fun reset() {
-        energyWindow.clear()
-        smoothedBpm = null
+        onsetEnvelope.clear()
+        sampleRate = 0
+        pendingSize = 0
+        smoothedEnergy = 0f
+        hasSmoothedEnergy = false
     }
 
-    // 输入一帧波形，输出当前估算 BPM。
-    fun addWaveformFrame(frame: ByteArray): Int? {
-        if (frame.isEmpty()) {
+    // 由解码器注入 PCM 采样率。
+    fun setSampleRate(sampleRate: Int) {
+        if (sampleRate > 0) {
+            this.sampleRate = sampleRate
+        }
+    }
+
+    // 连续喂入 mono PCM。
+    fun ingest(samples: FloatArray) {
+        if (samples.isEmpty()) {
+            return
+        }
+
+        ensurePendingCapacity(pendingSize + samples.size)
+        System.arraycopy(samples, 0, pendingSamples, pendingSize, samples.size)
+        pendingSize += samples.size
+
+        while (pendingSize >= frameSize) {
+            consumeFrame()
+        }
+    }
+
+    // 文件喂完后输出最终 BPM。
+    fun finish(): Int? {
+        if (sampleRate <= 0 || onsetEnvelope.size < 12) {
             return null
         }
 
-        // 把 8bit 波形转换成平均能量包络。
-        var sum = 0f
-        for (sample in frame) {
-            sum += abs(sample.toInt() - 128)
+        val envelope = FloatArray(onsetEnvelope.size) { onsetEnvelope[it] }
+        val mean = envelope.average().toFloat()
+        val centered = FloatArray(envelope.size)
+        var variance = 0f
+        for (index in envelope.indices) {
+            val centeredValue = envelope[index] - mean
+            centered[index] = centeredValue
+            variance += centeredValue * centeredValue
         }
-        val averageEnergy = sum / frame.size
-
-        // 维护固定长度滑动窗口。
-        if (energyWindow.size == windowCapacity) {
-            energyWindow.removeFirst()
-        }
-        energyWindow.addLast(averageEnergy)
-
-        // 样本还不够时，不急着给 BPM。
-        if (energyWindow.size < 160) {
+        if (variance <= 0f) {
             return null
         }
 
-        val energy = energyWindow.toList()
-        // Visualizer 回调约 100 次/秒，所以 6000/lag 可换成 BPM。
-        val lagMin = (6000f / maxBpm).toInt().coerceAtLeast(4)
-        val lagMax = (6000f / minBpm).toInt().coerceAtMost(energy.lastIndex / 2)
+        val lagMin = ceil(60f * sampleRate / (hopSize * maxBpm)).toInt().coerceAtLeast(1)
+        val lagMax = floor(60f * sampleRate / (hopSize * minBpm)).toInt()
+            .coerceAtMost(centered.lastIndex)
         if (lagMax <= lagMin) {
             return null
         }
 
-        // 在 BPM 区间内找自相关峰值最高的周期。
         var bestLag = -1
         var bestScore = Float.NEGATIVE_INFINITY
         for (lag in lagMin..lagMax) {
-            var score = 0f
-            for (index in lag until energy.size) {
-                score += energy[index] * energy[index - lag]
+            val span = centered.size - lag
+            if (span < 8) {
+                continue
             }
-            val normalizedScore = score / (energy.size - lag)
+
+            var numerator = 0f
+            var leftEnergy = 0f
+            var rightEnergy = 0f
+            for (index in 0 until span) {
+                val left = centered[index]
+                val right = centered[index + lag]
+                numerator += left * right
+                leftEnergy += left * left
+                rightEnergy += right * right
+            }
+
+            val denominator = sqrt(leftEnergy * rightEnergy)
+            if (denominator <= 0f) {
+                continue
+            }
+
+            val normalizedScore = numerator / denominator
             if (normalizedScore > bestScore) {
                 bestScore = normalizedScore
                 bestLag = lag
@@ -73,13 +121,45 @@ class BpmEstimator(
             return null
         }
 
-        // 把最佳周期换算成 BPM，再做指数平滑。
-        val instantBpm = 6000f / bestLag
-        smoothedBpm = if (smoothedBpm == null) {
-            instantBpm
-        } else {
-            smoothedBpm!! * 0.82f + instantBpm * 0.18f
+        return (60f * sampleRate / (hopSize * bestLag)).toInt()
+    }
+
+    private fun consumeFrame() {
+        var sumSquares = 0f
+        for (index in 0 until frameSize) {
+            val sample = pendingSamples[index]
+            sumSquares += sample * sample
         }
-        return smoothedBpm!!.toInt()
+        val rmsEnergy = sqrt(sumSquares / frameSize)
+        val onset = if (hasSmoothedEnergy) {
+            max(0f, rmsEnergy - smoothedEnergy)
+        } else {
+            0f
+        }
+        onsetEnvelope.add(onset)
+        smoothedEnergy = if (hasSmoothedEnergy) {
+            smoothedEnergy * energySmoothing + rmsEnergy * (1f - energySmoothing)
+        } else {
+            rmsEnergy
+        }
+        hasSmoothedEnergy = true
+
+        val remainingSamples = pendingSize - hopSize
+        if (remainingSamples > 0) {
+            System.arraycopy(pendingSamples, hopSize, pendingSamples, 0, remainingSamples)
+        }
+        pendingSize = remainingSamples
+    }
+
+    private fun ensurePendingCapacity(requiredSize: Int) {
+        if (requiredSize <= pendingSamples.size) {
+            return
+        }
+
+        var newCapacity = pendingSamples.size
+        while (newCapacity < requiredSize) {
+            newCapacity *= 2
+        }
+        pendingSamples = pendingSamples.copyOf(newCapacity)
     }
 }

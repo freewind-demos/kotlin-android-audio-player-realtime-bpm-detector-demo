@@ -3,19 +3,31 @@ package demos.bpmdetector.domain.handler
 import android.net.Uri
 import demos.bpmdetector.domain.store.PlayerStore
 import demos.bpmdetector.infra.system.AudioPickerSystemApi
+import demos.bpmdetector.infra.system.AudioPcmDecoderSystemApi
 import demos.bpmdetector.infra.system.AudioPlayerSystemApi
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 // Handler：编排 UI、Store、SystemApi。
 class PlayerHandler(
     private val store: PlayerStore,
     private val audioPickerSystemApi: AudioPickerSystemApi,
     private val audioPlayerSystemApi: AudioPlayerSystemApi,
-    private val bpmEstimator: BpmEstimator,
+    private val audioPcmDecoderSystemApi: AudioPcmDecoderSystemApi,
 ) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var analysisJob: Job? = null
+
     // 用户选歌后，解析文件名、加载播放器、准备实时分析。
     fun selectAudio(uri: Uri) {
+        analysisJob?.cancel()
         val displayName = audioPickerSystemApi.resolveDisplayName(uri)
-        bpmEstimator.reset()
         store.update {
             it.copy(
                 selectedAudioUri = uri,
@@ -28,43 +40,75 @@ class PlayerHandler(
             )
         }
 
+        analysisJob = scope.launch(Dispatchers.IO) {
+            val estimator = BpmEstimator()
+            try {
+                audioPcmDecoderSystemApi.decodeMonoPcm(
+                    uri = uri,
+                    isActive = { isActive },
+                ) { sampleRate, monoSamples ->
+                    estimator.setSampleRate(sampleRate)
+                    estimator.ingest(monoSamples)
+                }
+                if (!isActive) {
+                    return@launch
+                }
+                val bpm = estimator.finish() ?: return@launch
+                if (!isCurrentAudio(uri)) {
+                    return@launch
+                }
+                store.update {
+                    it.copy(
+                        bpmText = "$bpm BPM",
+                        errorText = null,
+                    )
+                }
+            } catch (_: CancellationException) {
+                return@launch
+            } catch (error: Exception) {
+                if (!isCurrentAudio(uri)) {
+                    return@launch
+                }
+                store.update {
+                    it.copy(
+                        statusText = "分析失败",
+                        errorText = error.message ?: "unknown analysis error",
+                    )
+                }
+            }
+        }
+
         audioPlayerSystemApi.load(
             uri = uri,
             onPrepared = {
+                if (!isCurrentAudio(uri)) {
+                    return@load
+                }
                 store.update {
                     it.copy(
                         isReady = true,
                         isPlaying = false,
-                        bpmText = "-- BPM",
                         statusText = "已加载，待播放",
                         errorText = null,
                     )
                 }
             },
             onCompleted = {
-                // 播放完成后回到静止态。
-                bpmEstimator.reset()
+                if (!isCurrentAudio(uri)) {
+                    return@load
+                }
                 store.update {
                     it.copy(
                         isPlaying = false,
-                        bpmText = "-- BPM",
                         statusText = "已停止",
                     )
                 }
             },
-            onWaveform = { waveform ->
-                // 只有估算出稳定 BPM 才推进 UI。
-                val bpm = bpmEstimator.addWaveformFrame(waveform) ?: return@load
-                store.update {
-                    if (!it.isPlaying) {
-                        it
-                    } else {
-                        it.copy(bpmText = "$bpm BPM")
-                    }
-                }
-            },
             onError = { message ->
                 // 系统层出错时，仅转成 UI 可读状态。
+                if (!isCurrentAudio(uri)) {
+                    return@load
+                }
                 store.update {
                     it.copy(
                         isReady = false,
@@ -99,21 +143,18 @@ class PlayerHandler(
         store.update {
             it.copy(
                 isPlaying = true,
-                statusText = "播放中，实时分析拍点",
-                bpmText = if (it.bpmText == "-- BPM") "分析中..." else it.bpmText,
+                statusText = if (it.bpmText == "分析中...") "播放中，分析中..." else "播放中",
             )
         }
     }
 
-    // 停止播放并清空本次估算窗口。
+    // 停止播放，但保留当前分析结果。
     fun stopPlayback() {
-        bpmEstimator.reset()
         audioPlayerSystemApi.stop()
         store.update {
             it.copy(
                 isReady = it.selectedAudioUri != null,
                 isPlaying = false,
-                bpmText = "-- BPM",
                 statusText = "已停止",
             )
         }
@@ -121,6 +162,12 @@ class PlayerHandler(
 
     // 页面销毁时释放系统资源。
     fun release() {
+        analysisJob?.cancel()
+        scope.cancel()
         audioPlayerSystemApi.release()
+    }
+
+    private fun isCurrentAudio(uri: Uri): Boolean {
+        return store.state.value.selectedAudioUri == uri
     }
 }

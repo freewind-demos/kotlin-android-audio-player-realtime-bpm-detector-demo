@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Audio BPM Detector</string>
+    <string name="pick_audio">选择音频</string>
+    <string name="no_audio_selected">未选择音频</string>
+    <string name="bpm_placeholder">-- BPM</string>
+    <string name="status_idle">待机</string>
+    <string name="status_ready">已加载，待播放</string>
+    <string name="status_playing">播放中，实时分析拍点</string>
+    <string name="status_paused">已暂停</string>
+    <string name="status_stopped">已停止</string>
+    <string name="status_error">播放失败</string>
+    <string name="play">播放</string>
+    <string name="pause">暂停</string>
+    <string name="stop">停止</string>
+    <string name="analysis_waiting">分析中...</string>
+</resources>

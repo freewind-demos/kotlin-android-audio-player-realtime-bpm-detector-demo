@@ -5,6 +5,12 @@ import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.sqrt
 
+// BPM + 首拍偏移。
+data class BpmEstimate(
+    val bpm: Int,
+    val beatOffsetMs: Int,
+)
+
 // 纯算法：把整首歌的 PCM 包络估算成 BPM。
 class BpmEstimator(
     // 估算下限，排除过慢周期。
@@ -61,7 +67,7 @@ class BpmEstimator(
     }
 
     // 文件喂完后输出最终 BPM。
-    fun finish(): Int? {
+    fun finish(): BpmEstimate? {
         if (sampleRate <= 0 || onsetEnvelope.size < 12) {
             return null
         }
@@ -121,7 +127,37 @@ class BpmEstimator(
             return null
         }
 
-        return (60f * sampleRate / (hopSize * bestLag)).toInt()
+        val bestPhase = findBestPhase(bestLag)
+        val bpm = (60f * sampleRate / (hopSize * bestLag)).toInt()
+        val beatOffsetMs = (bestPhase * hopSize * 1000f / sampleRate).toInt()
+        return BpmEstimate(
+            bpm = bpm,
+            beatOffsetMs = beatOffsetMs,
+        )
+    }
+
+    private fun findBestPhase(lag: Int): Int {
+        var bestPhase = 0
+        var bestScore = Float.NEGATIVE_INFINITY
+        for (phase in 0 until lag) {
+            var score = 0f
+            var count = 0
+            var index = phase
+            while (index < onsetEnvelope.size) {
+                score += onsetEnvelope[index]
+                count++
+                index += lag
+            }
+            if (count == 0) {
+                continue
+            }
+            val normalizedScore = score / count
+            if (normalizedScore > bestScore) {
+                bestScore = normalizedScore
+                bestPhase = phase
+            }
+        }
+        return bestPhase
     }
 
     private fun consumeFrame() {

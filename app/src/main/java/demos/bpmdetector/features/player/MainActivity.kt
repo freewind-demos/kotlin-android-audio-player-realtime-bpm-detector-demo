@@ -61,6 +61,11 @@ class MainActivity : ComponentActivity() {
                     binding.songNameText.text = state.selectedAudioName.ifEmpty { "未选择音频" }
                     binding.bpmText.text = state.bpmText
                     binding.statusText.text = state.errorText ?: state.statusText
+                    binding.beatSquare.visibility = if (state.beatVisible) {
+                        android.view.View.VISIBLE
+                    } else {
+                        android.view.View.INVISIBLE
+                    }
                     binding.playPauseButton.isEnabled = state.isReady
                     binding.stopButton.isEnabled = state.isReady || state.isPlaying
                     binding.playPauseButton.text = if (state.isPlaying) "暂停" else "播放"

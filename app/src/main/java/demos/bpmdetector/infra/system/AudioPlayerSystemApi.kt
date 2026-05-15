@@ -64,6 +64,9 @@ class AudioPlayerSystemApi(
     // 查询当前是否处于播放态。
     fun isPlaying(): Boolean = mediaPlayer?.isPlaying == true
 
+    // 当前播放进度。
+    fun currentPositionMs(): Int = mediaPlayer?.currentPosition ?: 0
+
     // 彻底释放系统资源。
     fun release() {
         mediaPlayer?.release()

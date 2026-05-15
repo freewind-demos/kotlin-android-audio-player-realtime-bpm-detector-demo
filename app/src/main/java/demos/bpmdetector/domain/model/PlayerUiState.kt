@@ -12,6 +12,8 @@ data class PlayerUiState(
     val isReady: Boolean = false,
     // 当前是否正在播放。
     val isPlaying: Boolean = false,
+    // 当前是否显示拍点红块。
+    val beatVisible: Boolean = false,
     // 屏幕中央的大号 BPM 文案。
     val bpmText: String = "-- BPM",
     // 页面底部状态文案。

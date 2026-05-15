@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -23,10 +24,15 @@ class PlayerHandler(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var analysisJob: Job? = null
+    private var beatJob: Job? = null
+    @Volatile
+    private var beatEstimate: BpmEstimate? = null
 
     // 用户选歌后，解析文件名、加载播放器、准备实时分析。
     fun selectAudio(uri: Uri) {
         analysisJob?.cancel()
+        stopBeatLoop()
+        beatEstimate = null
         val displayName = audioPickerSystemApi.resolveDisplayName(uri)
         store.update {
             it.copy(
@@ -34,6 +40,7 @@ class PlayerHandler(
                 selectedAudioName = displayName,
                 isReady = false,
                 isPlaying = false,
+                beatVisible = false,
                 bpmText = "分析中...",
                 statusText = "加载中...",
                 errorText = null,
@@ -53,15 +60,19 @@ class PlayerHandler(
                 if (!isActive) {
                     return@launch
                 }
-                val bpm = estimator.finish() ?: return@launch
+                val estimate = estimator.finish() ?: return@launch
                 if (!isCurrentAudio(uri)) {
                     return@launch
                 }
+                beatEstimate = estimate
                 store.update {
                     it.copy(
-                        bpmText = "$bpm BPM",
+                        bpmText = "${estimate.bpm} BPM",
                         errorText = null,
                     )
+                }
+                if (store.state.value.isPlaying) {
+                    startBeatLoop()
                 }
             } catch (_: CancellationException) {
                 return@launch
@@ -97,9 +108,11 @@ class PlayerHandler(
                 if (!isCurrentAudio(uri)) {
                     return@load
                 }
+                stopBeatLoop()
                 store.update {
                     it.copy(
                         isPlaying = false,
+                        beatVisible = false,
                         statusText = "已停止",
                     )
                 }
@@ -109,10 +122,12 @@ class PlayerHandler(
                 if (!isCurrentAudio(uri)) {
                     return@load
                 }
+                stopBeatLoop()
                 store.update {
                     it.copy(
                         isReady = false,
                         isPlaying = false,
+                        beatVisible = false,
                         statusText = "播放失败",
                         errorText = message,
                     )
@@ -130,9 +145,11 @@ class PlayerHandler(
 
         if (audioPlayerSystemApi.isPlaying()) {
             audioPlayerSystemApi.pause()
+            stopBeatLoop()
             store.update {
                 it.copy(
                     isPlaying = false,
+                    beatVisible = false,
                     statusText = "已暂停",
                 )
             }
@@ -146,15 +163,18 @@ class PlayerHandler(
                 statusText = if (it.bpmText == "分析中...") "播放中，分析中..." else "播放中",
             )
         }
+        startBeatLoop()
     }
 
     // 停止播放，但保留当前分析结果。
     fun stopPlayback() {
+        stopBeatLoop()
         audioPlayerSystemApi.stop()
         store.update {
             it.copy(
                 isReady = it.selectedAudioUri != null,
                 isPlaying = false,
+                beatVisible = false,
                 statusText = "已停止",
             )
         }
@@ -163,11 +183,70 @@ class PlayerHandler(
     // 页面销毁时释放系统资源。
     fun release() {
         analysisJob?.cancel()
+        stopBeatLoop()
         scope.cancel()
         audioPlayerSystemApi.release()
     }
 
     private fun isCurrentAudio(uri: Uri): Boolean {
         return store.state.value.selectedAudioUri == uri
+    }
+
+    private fun startBeatLoop() {
+        val estimate = beatEstimate ?: return
+        beatJob?.cancel()
+        beatJob = scope.launch {
+            val beatIntervalMs = 60_000L / estimate.bpm
+            val flashMs = (beatIntervalMs / 4).coerceIn(60L, 120L)
+            while (isActive && store.state.value.isPlaying) {
+                val delayMs = computeDelayToNextBeat(
+                    currentPositionMs = audioPlayerSystemApi.currentPositionMs(),
+                    beatOffsetMs = estimate.beatOffsetMs,
+                    beatIntervalMs = beatIntervalMs,
+                )
+                delay(delayMs)
+                if (!isActive || !store.state.value.isPlaying) {
+                    break
+                }
+                store.update {
+                    it.copy(beatVisible = true)
+                }
+                try {
+                    delay(flashMs)
+                } finally {
+                    store.update {
+                        it.copy(beatVisible = false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopBeatLoop() {
+        beatJob?.cancel()
+        beatJob = null
+        store.update {
+            it.copy(beatVisible = false)
+        }
+    }
+
+    private fun computeDelayToNextBeat(
+        currentPositionMs: Int,
+        beatOffsetMs: Int,
+        beatIntervalMs: Long,
+    ): Long {
+        val current = currentPositionMs.toLong()
+        val offset = beatOffsetMs.toLong()
+        if (current <= offset) {
+            return offset - current
+        }
+
+        val elapsed = current - offset
+        val remainder = elapsed % beatIntervalMs
+        return if (remainder == 0L) {
+            beatIntervalMs
+        } else {
+            beatIntervalMs - remainder
+        }
     }
 }

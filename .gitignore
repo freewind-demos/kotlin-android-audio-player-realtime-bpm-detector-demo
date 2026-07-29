@@ -5,3 +5,4 @@ build/
 app/build/
 *.iml
 captures/
+ build/ .gradle/ dist/
